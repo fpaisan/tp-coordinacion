@@ -3,6 +3,7 @@ package join
 import (
 	"log/slog"
 
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
 
@@ -48,6 +49,15 @@ func (join *Join) Run() {
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
+	_, _, isEof, _, err := inner.DeserializeMessage(&msg)
+	if err != nil {
+		slog.Error("While deserializing message in join", "err", err)
+		return
+	}
+	if isEof {
+		slog.Info("Join received EOF, closing client cycle")
+		return
+	}
 	if err := join.outputQueue.Send(msg); err != nil {
 		slog.Error("While sending top", "err", err)
 	}

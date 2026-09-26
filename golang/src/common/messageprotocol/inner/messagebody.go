@@ -9,20 +9,34 @@ import (
 
 type MessageBody struct {
 	ClientID     uint64                `json:"client_id"`
-	IsEOF        bool                  `json:"is_eof"`
+	IsEof        bool                  `json:"is_eof"`
 	FruitRecords []fruititem.FruitItem `json:"fruit_records"`
-	TotalCount   int64                 `json:"total_count"`
+	TotalCount   uint64                `json:"total_count"`
 }
 
-func NewMessageBody(clientID uint64, fruitRecords []fruititem.FruitItem, isEOF bool) (*middleware.Message, error) {
+func NewMessageBody(clientID uint64, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
 	if fruitRecords == nil {
 		fruitRecords = []fruititem.FruitItem{}
 	}
 	body := &MessageBody{
 		ClientID:     clientID,
-		IsEOF:        isEOF,
+		IsEof:        false,
 		FruitRecords: fruitRecords,
 		TotalCount:   0,
+	}
+	jsonBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return &middleware.Message{Body: string(jsonBytes)}, nil
+}
+
+func NewEOFMessageBody(clientID uint64, totalCount uint64) (*middleware.Message, error) {
+	body := &MessageBody{
+		ClientID:     clientID,
+		IsEof:        true,
+		FruitRecords: []fruititem.FruitItem{},
+		TotalCount:   totalCount,
 	}
 	jsonBytes, err := json.Marshal(body)
 	if err != nil {
