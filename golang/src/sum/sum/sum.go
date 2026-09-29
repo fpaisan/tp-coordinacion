@@ -1,8 +1,15 @@
 package sum
 
 import (
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -23,11 +30,16 @@ type SumConfig struct {
 type Sum struct {
 	id                   int
 	inputQueue           middleware.Middleware
-	outputExchange       middleware.Middleware
+	outputExchange       middleware.SelectiveSender
 	clientFruitItemMap   map[uint64]map[string]fruititem.FruitItem
-	controlInputQueue    middleware.Middleware
-	controlOutputQueue   middleware.Middleware
+	controlExchange      middleware.SelectiveSender
+	mapsLock             sync.Mutex
+	aggregationPrefix    string
+	aggregationAmount    int
 	clientMessageCounter map[uint64]uint64
+	remainingClientMsg   map[uint64]uint64
+	clientCoordinatorId  map[uint64]int
+	running              atomic.Bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -45,44 +57,45 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
 	if err != nil {
-		inputQueue.Close()
-		return nil, err
+		return nil, errors.Join(err, inputQueue.Close())
 	}
 
-	controlQueueName := fmt.Sprintf("%s_%d", config.SumPrefix, config.Id)
-	controlInputQueue, err := middleware.CreateQueueMiddleware(controlQueueName, connSettings)
+	controlExchangeKeys := []string{"control_broadcast", fmt.Sprintf("control_node_%d", config.Id)}
+	controlExchange, err := middleware.CreateExchangeMiddleware(fmt.Sprintf("control_node_%s", config.SumPrefix), controlExchangeKeys, connSettings)
 	if err != nil {
-		inputQueue.Close()
-		outputExchange.Close()
-		return nil, err
+		return nil, errors.Join(err, inputQueue.Close(), outputExchange.Close())
 	}
-	nextSumID := (config.Id + 1) % config.SumAmount
-	nextControlQueueName := fmt.Sprintf("%s_%d", config.SumPrefix, nextSumID)
-	controlOutputQueue, err := middleware.CreateQueueMiddleware(nextControlQueueName, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		outputExchange.Close()
-		controlInputQueue.Close()
-		return nil, err
-	}
-	return &Sum{
+
+	sum := &Sum{
 		id:                   config.Id,
 		inputQueue:           inputQueue,
 		outputExchange:       outputExchange,
 		clientFruitItemMap:   map[uint64]map[string]fruititem.FruitItem{},
-		controlInputQueue:    controlInputQueue,
-		controlOutputQueue:   controlOutputQueue,
+		controlExchange:      controlExchange,
 		clientMessageCounter: map[uint64]uint64{},
-	}, nil
+		remainingClientMsg:   map[uint64]uint64{},
+		clientCoordinatorId:  map[uint64]int{},
+		aggregationPrefix:    config.AggregationPrefix,
+		aggregationAmount:    config.AggregationAmount,
+	}
+	sum.running.Store(true)
+	return sum, nil
 }
 
-func (sum *Sum) Run() {
-	go sum.controlInputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleControlToken(msg, ack, nack)
-	})
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+func (sum *Sum) Run() error {
+	go sum.consumeControl()
+	go sum.handleSignals()
+	consumeErr := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+	closeErr := sum.closeMiddlewares()
+	if closeErr != nil {
+		slog.Warn("Middlewares closed with errors", "err", closeErr)
+	}
+	if !sum.running.Load() {
+		return nil
+	}
+	return errors.Join(consumeErr, closeErr)
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -95,8 +108,12 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	}
 
 	if isEof {
-		slog.Info("Got EOF from gateway, initiating ring cycle...", "clientID", clientID)
-		sum.passToken(clientID, totalCount, 0, false, -1)
+		slog.Info("Got EOF from gateway. Coordinator established.", "clientID", clientID)
+		err := sum.broadcastControlToken(clientID, totalCount)
+		if err != nil {
+			slog.Error("While broadcasting control token", "err", err)
+			return
+		}
 		return
 	}
 
@@ -106,17 +123,31 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 }
 
 func (sum *Sum) handleDataMessage(clientID uint64, fruitRecords []fruititem.FruitItem) error {
+	sum.mapsLock.Lock()
 	if _, exists := sum.clientFruitItemMap[clientID]; !exists {
 		sum.clientFruitItemMap[clientID] = map[string]fruititem.FruitItem{}
 	}
-	sum.clientMessageCounter[clientID]++
-	currentClientMap := sum.clientFruitItemMap[clientID]
 	for _, fruitRecord := range fruitRecords {
-		_, ok := currentClientMap[fruitRecord.Fruit]
+		_, ok := sum.clientFruitItemMap[clientID][fruitRecord.Fruit]
 		if ok {
-			currentClientMap[fruitRecord.Fruit] = currentClientMap[fruitRecord.Fruit].Sum(fruitRecord)
+			sum.clientFruitItemMap[clientID][fruitRecord.Fruit] = sum.clientFruitItemMap[clientID][fruitRecord.Fruit].Sum(fruitRecord)
 		} else {
-			currentClientMap[fruitRecord.Fruit] = fruitRecord
+			sum.clientFruitItemMap[clientID][fruitRecord.Fruit] = fruitRecord
+		}
+	}
+
+	sum.clientMessageCounter[clientID]++
+	coordID, coordExists := sum.clientCoordinatorId[clientID]
+	processed := sum.clientMessageCounter[clientID]
+	if coordExists {
+		sum.clientMessageCounter[clientID] = 0
+	}
+	sum.mapsLock.Unlock()
+
+	if coordExists {
+		message := inner.ControlToken{ClientID: clientID, Flag: inner.COUNT, CoordinatorID: coordID, CurrentCount: processed}
+		if err := sum.sendControlTokenTo(coordID, &message); err != nil {
+			slog.Error("While sending COUNT control message", "err", err)
 		}
 	}
 	return nil
@@ -125,85 +156,188 @@ func (sum *Sum) handleDataMessage(clientID uint64, fruitRecords []fruititem.Frui
 func (sum *Sum) handleControlToken(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	token, err := inner.DeserializeToken(&msg)
+	controlToken, err := inner.DeserializeControlToken(&msg)
 	if err != nil {
-		slog.Error("While deserializing token", "err", err)
+		slog.Error("While deserializing control token", "err", err)
 		return
 	}
 
-	if token.IsFinalRound {
-		if token.CoordinatorID == sum.id {
-			slog.Info("Ring cycle complete, sending final EOF to aggregators...", "clientID", token.CoordinatorID)
-			eofMessage, err := inner.SerializeEOF(token.ClientID, token.TotalTarget)
-			if err != nil {
-				slog.Error("While serializing EOF token", "err", err)
-				return
-			}
-			err = sum.outputExchange.Send(*eofMessage)
-			if err != nil {
-				slog.Error("While sending EOF", "err", err)
-				return
-			}
+	if controlToken.CoordinatorID == sum.id {
+		if controlToken.Flag != inner.COUNT {
 			return
 		}
-		slog.Info("Received token of last round, initiating flushing process...", "clientID", token.ClientID)
-		err := sum.flushFruitSums(token.ClientID)
-		if err != nil {
-			slog.Error("While flushing fruit sums", "err", err)
+		sum.mapsLock.Lock()
+		_, exists := sum.remainingClientMsg[controlToken.ClientID]
+		if !exists {
+			sum.mapsLock.Unlock()
+			slog.Warn("COUNT for already closed client", "clientId", controlToken.ClientID)
 			return
 		}
-		sum.passToken(token.ClientID, token.TotalTarget, token.CurrentCount, true, token.CoordinatorID)
+		sum.remainingClientMsg[controlToken.ClientID] -= controlToken.CurrentCount
+		allMessagesProcessed := sum.remainingClientMsg[controlToken.ClientID] == 0
+		if allMessagesProcessed {
+			delete(sum.remainingClientMsg, controlToken.ClientID)
+		}
+		sum.mapsLock.Unlock()
+
+		if allMessagesProcessed {
+			finalToken := inner.ControlToken{ClientID: controlToken.ClientID, Flag: inner.FINAL_ROUND, CoordinatorID: sum.id}
+			msg, err := inner.SerializeControlToken(&finalToken)
+			if err != nil {
+				return
+			}
+
+			if err := sum.controlExchange.SendTo(*msg, "control_broadcast"); err != nil {
+				slog.Error("While sending END control message", "err", err)
+				return
+			}
+		}
 		return
 	}
 
-	newContribution := sum.clientMessageCounter[token.ClientID]
-	newAccumulated := token.CurrentCount + newContribution
-	sum.clientMessageCounter[token.ClientID] = 0
+	if controlToken.Flag == inner.COORD {
+		sum.mapsLock.Lock()
+		sum.clientCoordinatorId[controlToken.ClientID] = controlToken.CoordinatorID
+		processed := sum.clientMessageCounter[controlToken.ClientID]
+		sum.clientMessageCounter[controlToken.ClientID] = 0
+		sum.mapsLock.Unlock()
 
-	if newAccumulated == token.TotalTarget {
-		slog.Info("Target count reached. Coordinator initiating final round...", "clientID", token.ClientID)
-		err := sum.flushFruitSums(token.ClientID)
-		if err != nil {
-			slog.Error("While flushing fruit", "err", err)
+		countToken := inner.ControlToken{ClientID: controlToken.ClientID, Flag: inner.COUNT, CoordinatorID: controlToken.CoordinatorID, CurrentCount: processed}
+		if err := sum.sendControlTokenTo(controlToken.CoordinatorID, &countToken); err != nil {
+			slog.Error("While sending COUNT control message", "err", err)
+		}
+	} else if controlToken.Flag == inner.FINAL_ROUND {
+		sum.mapsLock.Lock()
+		delete(sum.clientMessageCounter, controlToken.ClientID)
+		delete(sum.clientCoordinatorId, controlToken.ClientID)
+		sum.mapsLock.Unlock()
+
+		if err := sum.flushFruitSums(controlToken.ClientID); err != nil {
+			slog.Error("While sending client records", "err", err)
 			return
 		}
-		sum.passToken(token.ClientID, token.TotalTarget, newAccumulated, true, sum.id)
-	} else {
-		sum.passToken(token.ClientID, token.TotalTarget, newAccumulated, false, -1)
+		if err := sum.sendEOF(controlToken.ClientID); err != nil {
+			slog.Error("While sending end of the-records message", "err", err)
+			return
+		}
 	}
+	return
 }
 
 func (sum *Sum) flushFruitSums(clientID uint64) error {
-	fruitMap, exists := sum.clientFruitItemMap[clientID]
-	if exists {
-		for key := range fruitMap {
-			fruitRecord := []fruititem.FruitItem{fruitMap[key]}
-			message, err := inner.SerializeMessage(clientID, fruitRecord)
-			if err != nil {
-				slog.Debug("While serializing message", "err", err)
-				return err
-			}
-			if err := sum.outputExchange.Send(*message); err != nil {
-				slog.Debug("While sending message", "err", err)
-				return err
-			}
+	sum.mapsLock.Lock()
+	fruits, exists := sum.clientFruitItemMap[clientID]
+	delete(sum.clientFruitItemMap, clientID)
+	delete(sum.clientMessageCounter, clientID)
+	sum.mapsLock.Unlock()
+
+	if !exists {
+		return nil
+	}
+	batches := map[int][]fruititem.FruitItem{}
+	for _, fruitRecord := range fruits {
+		batch := sharding(fruitRecord.Fruit, sum.aggregationAmount)
+		batches[batch] = append(batches[batch], fruitRecord)
+	}
+
+	for batch, fruitRecords := range batches {
+		msg, err := inner.SerializeMessage(clientID, fruitRecords)
+		if err != nil {
+			return err
 		}
-		delete(sum.clientFruitItemMap, clientID)
-		delete(sum.clientMessageCounter, clientID)
+		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, batch)
+		if err := sum.outputExchange.SendTo(*msg, routingKey); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (sum *Sum) passToken(clientID uint64, totalTarget uint64, currentCount uint64, isFinalRound bool, coordinatorID int) {
-	tokenMsg, err := inner.SerializeToken(clientID, totalTarget, currentCount, isFinalRound, coordinatorID)
+func (sum *Sum) sendEOF(clientID uint64) error {
+	message, err := inner.SerializeEOF(clientID, 0)
 	if err != nil {
-		slog.Error("While serializing token", "err", err)
-		return
+		return err
 	}
-	err = sum.controlOutputQueue.Send(*tokenMsg)
+	if err := sum.outputExchange.Send(*message); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sum *Sum) sendControlTokenTo(id int, token *inner.ControlToken) error {
+	message, err := inner.SerializeControlToken(token)
 	if err != nil {
-		slog.Error("While passing token", "err", err)
-		return
+		return err
 	}
-	return
+	return sum.controlExchange.SendTo(*message, fmt.Sprintf("control_node_%d", id))
+}
+
+func (sum *Sum) broadcastControlToken(clientID uint64, totalCount uint64) error {
+	sum.mapsLock.Lock()
+	sum.remainingClientMsg[clientID] = totalCount - sum.clientMessageCounter[clientID]
+	delete(sum.clientMessageCounter, clientID)
+	sum.mapsLock.Unlock()
+
+	err := sum.flushFruitSums(clientID)
+	if err != nil {
+		slog.Error("While flushing", "err", err)
+		return err
+	}
+
+	err = sum.sendEOF(clientID)
+	if err != nil {
+		slog.Error("While sending EOF", "err", err)
+		return err
+	}
+
+	token := inner.ControlToken{ClientID: clientID, Flag: inner.COORD, CoordinatorID: sum.id}
+	msg, err := inner.SerializeControlToken(&token)
+	if err != nil {
+		slog.Error("While serializing control token", "err", err)
+		return err
+	}
+	err = sum.controlExchange.SendTo(*msg, "control_broadcast")
+	if err != nil {
+		slog.Error("While broadcasting token as coordinator", "err", err)
+		return err
+	}
+	return nil
+}
+
+func (sum *Sum) consumeControl() {
+	if err := sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.handleControlToken(msg, ack, nack)
+	}); err != nil && sum.running.Load() {
+		slog.Error("Sum control consumer stopped with error", "err", err)
+	}
+}
+
+func sharding(fruitName string, aggregationAmount int) int {
+	h := fnv.New32a()
+	_, err := h.Write([]byte(fruitName))
+	if err != nil {
+		slog.Info("Error sharding fruit", "err", err)
+		return 0
+	}
+	targetIndex := h.Sum32() % uint32(aggregationAmount)
+	return int(targetIndex)
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	sum.running.Store(false)
+	_ = sum.inputQueue.StopConsuming()
+	_ = sum.controlExchange.StopConsuming()
+}
+
+func (sum *Sum) closeMiddlewares() error {
+	return errors.Join(
+		sum.inputQueue.StopConsuming(),
+		sum.controlExchange.StopConsuming(),
+		sum.inputQueue.Close(),
+		sum.outputExchange.Close(),
+		sum.controlExchange.Close())
 }

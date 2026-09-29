@@ -19,7 +19,7 @@ func CreateQueueMiddleware(queueName string, connectionSettings ConnSettings) (M
 	return middleware, nil
 }
 
-func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings ConnSettings) (Middleware, error) {
+func CreateExchangeMiddleware(exchange string, keys []string, connectionSettings ConnSettings) (SelectiveSender, error) {
 	conn, channel, err := connect(connectionSettings)
 	if err != nil {
 		return nil, err

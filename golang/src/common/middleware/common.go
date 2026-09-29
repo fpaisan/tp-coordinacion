@@ -34,7 +34,7 @@ func consumeMessages(queueName string, channel *amqp.Channel, consumerTag string
 			}
 		}
 		nack := func() {
-			err := d.Nack(false, true)
+			err := d.Nack(false, false)
 			if err != nil {
 				return
 			}

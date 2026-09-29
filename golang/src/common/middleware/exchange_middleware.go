@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"errors"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -12,7 +13,7 @@ type ExchangeMiddleware struct {
 	Connection  *amqp.Connection
 	Channel     *amqp.Channel
 	QueueName   string
-	isConsuming bool
+	isConsuming atomic.Bool
 }
 
 func NewExchangeMiddleware(exchange string, keys []string, conn *amqp.Connection, channel *amqp.Channel) (*ExchangeMiddleware, error) {
@@ -31,7 +32,7 @@ func NewExchangeMiddleware(exchange string, keys []string, conn *amqp.Connection
 }
 
 func (e *ExchangeMiddleware) StartConsuming(callbackFunc func(msg Message, ack func(), nack func())) error {
-	err := checkResources(e.isConsuming, e.Connection, e.Channel)
+	err := checkResources(e.isConsuming.Load(), e.Connection, e.Channel)
 	if err != nil {
 		return err
 	}
@@ -57,12 +58,12 @@ func (e *ExchangeMiddleware) StartConsuming(callbackFunc func(msg Message, ack f
 			return ErrMessageMiddlewareMessage
 		}
 	}
-	e.isConsuming = true
+	e.isConsuming.Store(true)
 	if err := consumeMessages(e.QueueName, e.Channel, e.QueueName, callbackFunc); err != nil {
-		e.isConsuming = false
+		e.isConsuming.Store(false)
 		return err
 	}
-	if e.isConsuming {
+	if e.isConsuming.Load() {
 		return ErrMessageMiddlewareDisconnected
 	}
 	return nil
@@ -72,10 +73,10 @@ func (e *ExchangeMiddleware) StopConsuming() error {
 	if e.Connection.IsClosed() {
 		return ErrMessageMiddlewareDisconnected
 	}
-	if !e.isConsuming {
+	if !e.isConsuming.Load() {
 		return nil
 	}
-	e.isConsuming = false
+	e.isConsuming.Store(false)
 	return cancelChannel(e.QueueName, e.Channel)
 }
 
@@ -91,6 +92,20 @@ func (e *ExchangeMiddleware) Send(msg Message) error {
 		if err := publish(e.Channel, e.exchange, key, msg.Body); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (e *ExchangeMiddleware) SendTo(msg Message, routingKey string) error {
+	if e.Channel.IsClosed() {
+		return ErrMessageMiddlewareDisconnected
+	}
+	if e.Connection.IsClosed() {
+		return ErrMessageMiddlewareDisconnected
+	}
+
+	if err := publish(e.Channel, e.exchange, routingKey, msg.Body); err != nil {
+		return err
 	}
 	return nil
 }
