@@ -78,24 +78,23 @@ func (join *Join) Run() error {
 	return errors.Join(consumeErr, closeErr)
 }
 
-func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) error {
+func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	clientID, fruitRecordsTop, isEof, _, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message in Join", "err", err)
 		nack()
-		return err
+		return
 	}
 	defer ack()
 
 	if isEof {
 		if err = join.handleEndOfRecordsMessage(clientID); err != nil {
 			slog.Error("While handling End Of Records message in Join", "err", err)
-			return err
+			return
 		}
 	} else {
 		join.updateClientTop(clientID, fruitRecordsTop)
 	}
-	return nil
 }
 
 func (join *Join) handleEndOfRecordsMessage(clientID uint64) error {
@@ -118,11 +117,11 @@ func (join *Join) sendClientTop(clientID uint64) error {
 
 	message, err := inner.SerializeMessage(clientID, finalTop)
 	if err != nil {
-		slog.Error("While serializing final top in Join", "err", err)
+		slog.Error("serializing final top", "err", err)
 		return err
 	}
 	if err := join.outputQueue.Send(*message); err != nil {
-		slog.Error("While sending message to output queue", "err", err)
+		slog.Error("sending final top", "err", err)
 		return err
 	}
 	return nil
@@ -165,7 +164,9 @@ func (join *Join) handleSignals() {
 	<-signals
 	slog.Info("SIGTERM signal received")
 	join.running.Store(false)
-	_ = join.inputQueue.StopConsuming()
+	if err := join.inputQueue.StopConsuming(); err != nil {
+		slog.Debug("Error stopping consumers", "err", err)
+	}
 }
 
 func (join *Join) closeMiddlewares() error {

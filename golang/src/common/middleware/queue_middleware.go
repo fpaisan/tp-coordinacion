@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"errors"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -10,7 +11,7 @@ type WorkQueueMiddleware struct {
 	QueueName   string
 	Connection  *amqp.Connection
 	Channel     *amqp.Channel
-	isConsuming bool
+	isConsuming atomic.Bool
 }
 
 func NewWorkQueueMiddleware(queueName string, conn *amqp.Connection, channel *amqp.Channel) (*WorkQueueMiddleware, error) {
@@ -27,7 +28,7 @@ func NewWorkQueueMiddleware(queueName string, conn *amqp.Connection, channel *am
 }
 
 func (q *WorkQueueMiddleware) StartConsuming(callbackFunc func(msg Message, ack func(), nack func())) error {
-	err := checkResources(q.isConsuming, q.Connection, q.Channel)
+	err := checkResources(q.isConsuming.Load(), q.Connection, q.Channel)
 	if err != nil {
 		return err
 	}
@@ -42,12 +43,12 @@ func (q *WorkQueueMiddleware) StartConsuming(callbackFunc func(msg Message, ack 
 		}
 		return ErrMessageMiddlewareMessage
 	}
-	q.isConsuming = true
+	q.isConsuming.Store(true)
 	if err := consumeMessages(q.QueueName, q.Channel, q.QueueName, callbackFunc); err != nil {
-		q.isConsuming = false
+		q.isConsuming.Store(false)
 		return err
 	}
-	if q.isConsuming {
+	if q.isConsuming.Load() {
 		return ErrMessageMiddlewareDisconnected
 	}
 	return nil
@@ -57,10 +58,10 @@ func (q *WorkQueueMiddleware) StopConsuming() error {
 	if q.Connection.IsClosed() {
 		return ErrMessageMiddlewareDisconnected
 	}
-	if !q.isConsuming {
+	if !q.isConsuming.Load() {
 		return nil
 	}
-	q.isConsuming = false
+	q.isConsuming.Store(false)
 	return cancelChannel(q.QueueName, q.Channel)
 }
 

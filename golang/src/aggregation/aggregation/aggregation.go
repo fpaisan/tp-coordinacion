@@ -48,8 +48,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	inputExchangeRoutingKey := []string{fmt.Sprintf("%s_%d", config.AggregationPrefix, config.Id)}
 	inputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, inputExchangeRoutingKey, connSettings)
 	if err != nil {
-		outputQueue.Close()
-		return nil, err
+		return nil, errors.Join(err, outputQueue.Close())
 	}
 
 	aggregation := &Aggregation{
@@ -81,17 +80,17 @@ func (aggregation *Aggregation) Run() error {
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-
 	clientID, fruitRecords, isEof, _, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
+		nack()
 		return
 	}
+	defer ack()
 
 	if isEof {
 		if err := aggregation.handleEndOfRecordsMessage(clientID); err != nil {
-			slog.Error("While handling end of record message", "err", err)
+			slog.Error("While closing aggregation round", "clientID", clientID, "err", err)
 		}
 		return
 	}
@@ -100,7 +99,7 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(clientID uint64) error {
-	slog.Info("Received End Of Records message")
+	slog.Info("Received End Of Records message", "clientID", clientID)
 	aggregation.receivedEOFs[clientID]++
 	if aggregation.receivedEOFs[clientID] < aggregation.expectedEOFs {
 		return nil
@@ -110,21 +109,21 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(clientID uint64) error
 	if len(fruitTopRecords) > 0 {
 		message, err := inner.SerializeMessage(clientID, fruitTopRecords)
 		if err != nil {
-			slog.Error("While serializing top message", "err", err)
+			slog.Error("serializing top message", "err", err)
 			return err
 		}
 		if err := aggregation.outputQueue.Send(*message); err != nil {
-			slog.Error("While sending", "err", err)
+			slog.Error("sending top message", "err", err)
 			return err
 		}
 	}
 	eof, err := inner.SerializeEOF(clientID, 0)
 	if err != nil {
-		slog.Error("While serializing EOF message", "err", err)
+		slog.Error("serializing EOF", "err", err)
 		return err
 	}
 	if err := aggregation.outputQueue.Send(*eof); err != nil {
-		slog.Error("While sending", "err", err)
+		slog.Error("sending EOF", "err", err)
 		return err
 	}
 	delete(aggregation.clientFruitItemMap, clientID)
@@ -168,7 +167,9 @@ func (aggregation *Aggregation) handleSignals() {
 	<-signals
 	slog.Info("SIGTERM signal received")
 	aggregation.running.Store(false)
-	_ = aggregation.inputExchange.StopConsuming()
+	if err := aggregation.inputExchange.StopConsuming(); err != nil {
+		slog.Debug("Error stopping consumers", "err", err)
+	}
 }
 
 func (aggregation *Aggregation) closeMiddlewares() error {
